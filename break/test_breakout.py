@@ -1,7 +1,7 @@
 """
 Integration test & demo for the trendline breakout detection module.
 
-Runs three mock scenarios, prints breakout events, and saves charts to PNG.
+Runs all mock scenarios, prints breakout events, and saves charts to PNG.
 """
 
 from __future__ import annotations
@@ -13,7 +13,17 @@ from pathlib import Path
 import pandas as pd
 
 from .core import detect_latest_breakout, scan_all_breakouts
-from .mock_data import ascending_breakout, channel_with_breakout, descending_triangle
+from .mock_data import (
+    ascending_breakout,
+    channel_with_breakout,
+    descending_triangle,
+    falling_wedge,
+    head_and_shoulders_top,
+    inverse_head_and_shoulders,
+    m_top,
+    rising_wedge,
+    w_bottom,
+)
 from .visualize import plot_trendline_breakouts
 
 
@@ -31,7 +41,6 @@ def run_scenario(
 ) -> None:
     _divider(name)
 
-    # --- Latest bar detection ---
     result = detect_latest_breakout(df, **kwargs)
     if result is None:
         print("  [No result — not enough data]")
@@ -48,7 +57,6 @@ def run_scenario(
             print(f"  Support line       : y = {s.m:.4f}·x + {s.b:.2f}  "
                   f"(touches={s.touches}, violations={s.violations}, score={s.score:.1f})")
 
-    # --- Full history scan ---
     events = scan_all_breakouts(df, **kwargs)
     print(f"\n  Total breakout events across history: {len(events)}")
     if events:
@@ -56,7 +64,6 @@ def run_scenario(
         ev_df = pd.DataFrame(rows)
         print(ev_df.to_string(index=False, max_cols=10))
 
-    # --- Visualization ---
     fig = plot_trendline_breakouts(df, title=name, **kwargs)
     out_path = save_dir / f"{name.lower().replace(' ', '_')}.png"
     fig.savefig(str(out_path), dpi=150, bbox_inches="tight")
@@ -83,6 +90,12 @@ def main() -> None:
         ("Descending Triangle Breakdown", descending_triangle(300)),
         ("Ascending Breakout Up", ascending_breakout(300)),
         ("Channel Breakout Up", channel_with_breakout(300)),
+        ("M Top Double Top", m_top()),
+        ("W Bottom Double Bottom", w_bottom()),
+        ("Head and Shoulders Top", head_and_shoulders_top()),
+        ("Inverse Head and Shoulders", inverse_head_and_shoulders()),
+        ("Rising Wedge Bearish", rising_wedge()),
+        ("Falling Wedge Bullish", falling_wedge()),
     ]
 
     for name, df in scenarios:

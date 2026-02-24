@@ -7,6 +7,17 @@ from .core import (
     detect_latest_breakout,
     scan_all_breakouts,
 )
+from .mock_data import (
+    ascending_breakout,
+    channel_with_breakout,
+    descending_triangle,
+    falling_wedge,
+    head_and_shoulders_top,
+    inverse_head_and_shoulders,
+    m_top,
+    rising_wedge,
+    w_bottom,
+)
 from .visualize import plot_trendline_breakouts
 
 __all__ = [
@@ -18,4 +29,13 @@ __all__ = [
     "detect_latest_breakout",
     "scan_all_breakouts",
     "plot_trendline_breakouts",
+    "ascending_breakout",
+    "channel_with_breakout",
+    "descending_triangle",
+    "falling_wedge",
+    "head_and_shoulders_top",
+    "inverse_head_and_shoulders",
+    "m_top",
+    "rising_wedge",
+    "w_bottom",
 ]
