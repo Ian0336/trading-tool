@@ -18,10 +18,10 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-from .fetch import fetch_klines, save_csv, to_break_df
+from .fetch import fetch_klines, make_run_dir, save_csv, to_break_df
 
-# Output directory for cached CSVs
-DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+# Output directory: data/<YYYYMMDD_HH>/
+DATA_DIR = make_run_dir(Path(__file__).resolve().parents[1] / "data")
 
 INTERVAL = "15m"
 LAST_N_DAYS = 7

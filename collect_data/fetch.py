@@ -157,6 +157,19 @@ def to_break_df(df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def make_run_dir(base: str | Path = "data") -> Path:
+    """
+    Create and return a timestamped subdirectory under *base*.
+
+    Format: ``data/20260224_16`` (date + hour, UTC).
+    If it already exists (same hour), reuses it.
+    """
+    stamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H")
+    run_dir = Path(base) / stamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
 def save_csv(df: pd.DataFrame, path: str | Path) -> None:
     """Save a klines DataFrame to CSV."""
     path = Path(path)
