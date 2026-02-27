@@ -1,12 +1,9 @@
 """
-Quick analysis script: load cached CSV → breakout scan → chart.
-
-Automatically finds the **latest** timestamped run directory under data/
-(e.g. data/20260224_16/) and analyses all CSVs in it.
+End-to-end pipeline: fetch data → breakout scan → chart.
 
 Usage:
-    uv run python run_analysis.py               # use latest run dir
-    uv run python run_analysis.py 20260224_16    # use specific run dir
+    uv run python run_analysis.py               # fetch fresh data, then analyse
+    uv run python run_analysis.py 20260225_14    # skip fetch, analyse existing run dir
 """
 
 from __future__ import annotations
@@ -15,6 +12,7 @@ import importlib
 import sys
 from pathlib import Path
 
+from collect_data import collect
 from collect_data.fetch import load_csv
 
 core = importlib.import_module("break.core")
@@ -23,28 +21,11 @@ viz = importlib.import_module("break.visualize")
 DATA_ROOT = Path("data")
 
 
-def _find_run_dir(explicit: str | None = None) -> Path:
-    """
-    Return the run directory to analyse.
-    If *explicit* is given, use ``data/<explicit>``.
-    Otherwise pick the lexicographically latest subdirectory under data/.
-    """
-    if explicit:
-        d = DATA_ROOT / explicit
-        if not d.is_dir():
-            raise FileNotFoundError(f"Run directory not found: {d}")
-        return d
-
-    subdirs = sorted(
-        [p for p in DATA_ROOT.iterdir() if p.is_dir() and p.name != "charts"],
-        reverse=True,
-    )
-    if not subdirs:
-        raise FileNotFoundError(
-            f"No run directories found under {DATA_ROOT}/. "
-            "Run 'uv run python -m collect_data' first."
-        )
-    return subdirs[0]
+def _find_run_dir(name: str) -> Path:
+    d = DATA_ROOT / name
+    if not d.is_dir():
+        raise FileNotFoundError(f"Run directory not found: {d}")
+    return d
 
 
 def analyze(title: str, csv_path: Path, chart_dir: Path) -> None:
@@ -76,8 +57,7 @@ def analyze(title: str, csv_path: Path, chart_dir: Path) -> None:
               f"line={e.line_value:.2f}  atr={e.atr_value:.2f}")
 
     fig = viz.plot_trendline_breakouts(df, title=title)
-    stem = csv_path.stem
-    out = chart_dir / f"{stem}_chart.png"
+    out = chart_dir / f"{csv_path.stem}_chart.png"
     fig.savefig(str(out), dpi=150, bbox_inches="tight")
     print(f"\n  Chart → {out}")
 
@@ -86,14 +66,17 @@ def analyze(title: str, csv_path: Path, chart_dir: Path) -> None:
 
 
 def main() -> None:
-    # Accept optional CLI argument for a specific run directory name
-    explicit = sys.argv[1] if len(sys.argv) > 1 else None
-    run_dir = _find_run_dir(explicit)
+    # If a run directory name is given, skip fetching and use it directly.
+    # Otherwise, fetch fresh data first.
+    if len(sys.argv) > 1:
+        run_dir = _find_run_dir(sys.argv[1])
+    else:
+        run_dir = collect()
 
     chart_dir = run_dir / "charts"
     chart_dir.mkdir(exist_ok=True)
 
-    print(f"  Using run directory: {run_dir}")
+    print(f"  Analysing run directory: {run_dir}")
 
     csvs = sorted(run_dir.glob("*.csv"))
     if not csvs:
