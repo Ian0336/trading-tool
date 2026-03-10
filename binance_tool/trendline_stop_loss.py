@@ -4,8 +4,10 @@ Trendline Stop-Loss Monitor
 ============================
 1. Fetches all open USDⓈ-M Futures positions.
 2. Lets you pick the position to protect.
-3. Asks for two candle close-time + interval; fetches the close prices from
-   Binance history to define the trend line.
+3. Defines the trend line the same way TradingView does:
+     • Two anchor points, each given as (price, N bars ago).
+     • Slope = Δprice / Δbars  (price per bar), then converted to price/ms
+       so the line can be evaluated at any future moment.
 4. Polls mark price every 60 s; fires a market close order when price crosses
    the extrapolated line.
 
@@ -13,8 +15,9 @@ Key design rules
 ----------------
 - LONG position  → stop fires when mark price falls *to or below* the line.
 - SHORT position → stop fires when mark price rises *to or above* the line.
-- The line is extrapolated beyond the two anchor points using a constant slope
-  (i.e. it extends infinitely in both directions at the same rate).
+- "N bars ago" anchors to the OPEN of that bar (same convention as TradingView
+  bar-index coordinates).  The default interval is 15 m.
+- All time display uses UTC+8 (Asia/Taipei).
 
 Usage
 -----
@@ -38,8 +41,9 @@ import pandas as pd
 # ── Path bootstrap ─────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from collect_data.client import iter_kline_pages
 from utils.get_keys import get_secret
+
+DISPLAY_TZ = "Asia/Taipei"   # UTC+8
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -145,43 +149,39 @@ def is_hedge_mode(client: httpx.Client, secret: str) -> bool:
     return bool(data.get("dualSidePosition", False))
 
 
-# ── Kline / close-price helpers ────────────────────────────────────────────────
+# ── Bar-index helpers ──────────────────────────────────────────────────────────
 
-def fetch_close_price(symbol: str, close_time_str: str, interval: str) -> float:
+def current_bar_open_ms(interval: str) -> int:
     """
-    Return the close price of the candle whose close_time equals close_time_str.
+    Return the open-time (ms) of the bar that is currently forming,
+    snapped to the bar boundary.
 
-    Parameters
-    ----------
-    close_time_str : "YYYY-MM-DD HH:MM"  (interpreted as UTC)
-    interval       : Binance interval, e.g. "15m"
+    This matches TradingView's bar-index 0 = current (open) bar.
     """
-    bar_ms = _INTERVAL_MS.get(interval.lower())
-    if bar_ms is None:
-        raise ValueError(
-            f"Unsupported interval '{interval}'. "
-            f"Supported: {list(_INTERVAL_MS)}"
-        )
+    bar_ms = _INTERVAL_MS[interval]
+    now_ms = int(time.time() * 1000)
+    return (now_ms // bar_ms) * bar_ms
 
-    close_ts = pd.Timestamp(close_time_str, tz="UTC")
-    close_ms = int(close_ts.value // 1_000_000)
 
-    # The candle that closes at close_ms opens one interval earlier
-    start_ms = close_ms - bar_ms
-    end_ms   = close_ms + 1_000   # 1-second buffer to ensure we capture this bar
+def bars_ago_to_ms(bars_ago: int, interval: str) -> int:
+    """
+    Convert "N bars ago" to the open-time (ms) of that bar.
 
-    rows: list[list] = []
-    for page in iter_kline_pages(symbol, interval, start_ms, end_ms, market="futures"):
-        rows.extend(page)
+    bars_ago = 0  →  current (still-forming) bar open
+    bars_ago = 1  →  last fully closed bar open
+    bars_ago = N  →  N bars back from the current bar open
+    """
+    bar_ms = _INTERVAL_MS[interval]
+    return current_bar_open_ms(interval) - bars_ago * bar_ms
 
-    if not rows:
-        raise ValueError(
-            f"No klines returned for {symbol} {interval} around {close_time_str}. "
-            "Check that the timestamp and symbol are correct."
-        )
 
-    # Binance kline column 4 = close price
-    return float(rows[-1][4])
+def ms_to_display(ms: int) -> str:
+    """Format a millisecond timestamp as a human-readable UTC+8 string."""
+    return (
+        pd.Timestamp(ms, unit="ms", tz="UTC")
+        .tz_convert(DISPLAY_TZ)
+        .strftime("%Y-%m-%d %H:%M")
+    )
 
 
 # ── Trend-line math ─────────────────────────────────────────────────────────────
@@ -257,27 +257,65 @@ def prompt_select_position(positions: list[dict]) -> dict:
         print(f"  Please enter a number between 1 and {len(positions)}.")
 
 
-def prompt_candle_point(label: str, symbol: str) -> tuple[int, float]:
+def prompt_interval() -> str:
+    """Ask for candle interval once; default is 15m."""
+    raw = input("\nCandle interval [15m]: ").strip() or "15m"
+    if raw not in _INTERVAL_MS:
+        print(f"  Unknown interval '{raw}', falling back to 15m.")
+        return "15m"
+    return raw
+
+
+def _ask_price(prompt_text: str) -> float:
+    while True:
+        raw = input(prompt_text).strip()
+        try:
+            return float(raw)
+        except ValueError:
+            print("  Enter a valid number.")
+
+
+def _ask_positive_int(prompt_text: str) -> int:
+    while True:
+        raw = input(prompt_text).strip()
+        try:
+            val = int(raw)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+        print("  Enter a positive integer.")
+
+
+def prompt_trendline_points(interval: str) -> tuple[tuple[int, float], tuple[int, float]]:
     """
-    Ask for a candle close-time and interval, auto-fetch the close price.
-    Returns (timestamp_ms, close_price).
+    Collect two anchor points, each specified independently as
+    (price, bars ago from current bar).
+
+    Returns ((t1_ms, p1), (t2_ms, p2)).  The two points may be given in any
+    order; the function always returns them sorted oldest-first (t1 < t2).
     """
-    print(f"\n--- Anchor point {label} ---")
-    print("  Timestamp: YYYY-MM-DD HH:MM  (UTC, e.g.  2026-02-22 14:15)")
+    bar_ms = _INTERVAL_MS[interval]
 
-    ts_str   = input("  Close time (UTC): ").strip()
-    interval = input("  Candle interval  [15m]: ").strip() or "15m"
+    def ask_point(label: str) -> tuple[int, float]:
+        print(f"\n--- Anchor point {label} ---")
+        price    = _ask_price("  Price: ")
+        bars_ago = _ask_positive_int("  Bars ago from current bar: ")
+        ts_ms    = bars_ago_to_ms(bars_ago, interval)
+        print(f"  → {ms_to_display(ts_ms)} ~ {ms_to_display(ts_ms + bar_ms)}  (UTC+8)")
+        return ts_ms, price
 
-    print(f"  Fetching {symbol} {interval} candle at {ts_str} …")
-    price = fetch_close_price(symbol, ts_str, interval)
-    print(f"  → Close price: {price:.6g}")
+    a = ask_point("1")
+    b = ask_point("2")
 
-    override = input("  Use this price? [Y/n]: ").strip().lower()
-    if override == "n":
-        price = float(input("  Enter price manually: ").strip())
+    if a[0] == b[0]:
+        print("[ERROR] Both points land on the same bar — cannot define a line.")
+        sys.exit(1)
 
-    ts_ms = int(pd.Timestamp(ts_str, tz="UTC").value // 1_000_000)
-    return ts_ms, price
+    # Ensure chronological order regardless of input sequence
+    t1_ms, p1 = min(a, b, key=lambda x: x[0])
+    t2_ms, p2 = max(a, b, key=lambda x: x[0])
+    return (t1_ms, p1), (t2_ms, p2)
 
 
 # ── Monitor loop ───────────────────────────────────────────────────────────────
@@ -327,9 +365,9 @@ def run_monitor(
     direction = "≤ (below or at)" if is_long else "≥ (above or at)"
     print(f"\n{'=' * 60}")
     print(f"  Monitoring  {symbol}  ({'LONG' if is_long else 'SHORT'})")
-    print(f"  Trend line anchors:")
-    print(f"    Point 1: {pd.Timestamp(t1_ms, unit='ms', tz='UTC')}  →  {p1:.6g}")
-    print(f"    Point 2: {pd.Timestamp(t2_ms, unit='ms', tz='UTC')}  →  {p2:.6g}")
+    print(f"  Trend line anchors (UTC+8):")
+    print(f"    Point 1: {ms_to_display(t1_ms)}  →  {p1:.6g}")
+    print(f"    Point 2: {ms_to_display(t2_ms)}  →  {p2:.6g}")
     print(f"  Stop fires when mark price {direction} line value")
     print(f"  Poll every {poll_interval_s}s  |  Ctrl-C to abort")
     print(f"{'=' * 60}\n")
@@ -387,14 +425,10 @@ def main() -> None:
 
         print(f"\nSelected: {symbol}  "
               f"({'LONG' if float(selected['positionAmt']) > 0 else 'SHORT'})")
-        print("Define the trend line using two candle close prices.\n")
+        print("Define the trend line: two anchor points, left→right (older → newer).\n")
 
-        t1_ms, p1 = prompt_candle_point("1", symbol)
-        t2_ms, p2 = prompt_candle_point("2", symbol)
-
-        if t1_ms == t2_ms:
-            print("[ERROR] Both anchor points share the same timestamp — cannot define a line.")
-            return
+        interval = prompt_interval()
+        (t1_ms, p1), (t2_ms, p2) = prompt_trendline_points(interval)
 
         input("\nPress Enter to start monitoring (Ctrl-C to abort) … ")
 
