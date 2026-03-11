@@ -769,6 +769,28 @@ def _cancel_order(
     return data
 
 
+def cancel_all_open_orders(
+    client: httpx.Client,
+    secret: str,
+    base_url: str,
+    symbol: str,
+) -> None:
+    """
+    Cancel every open regular order for *symbol* in one call.
+    Silently ignores "no open orders" responses.
+    """
+    try:
+        _signed_delete(client, secret, base_url,
+                       "/fapi/v1/allOpenOrders", {"symbol": symbol})
+        log.info("All open regular orders for %s cancelled.", symbol)
+    except httpx.HTTPStatusError as exc:
+        # -2011 = "Unknown order" / nothing to cancel — safe to ignore
+        if "code=-2011" in str(exc) or "code=-1013" in str(exc):
+            log.info("No open regular orders to cancel for %s.", symbol)
+        else:
+            log.warning("cancel_all_open_orders failed: %s", exc)
+
+
 def _cancel_algo_order(
     client: httpx.Client,
     secret: str,
@@ -904,6 +926,10 @@ def place_orders(
       3) cancel any unfilled remainder
       4) place SL + TP as Algo orders protecting the actual position
       5) if Algo placement fails, try an emergency MARKET reduce-only close
+
+    Ctrl-C at any stage triggers a cleanup sequence:
+      - cancel the pending entry order (if not yet filled)
+      - cancel any partially placed algo orders
     """
     is_long = direction == "LONG"
     pos_side = direction
@@ -913,125 +939,119 @@ def place_orders(
     dp_p = params["dp_price"]
     dp_q = params["dp_qty"]
 
-    # ── 1. Limit entry ─────────────────────────────────────────────────────────
-    entry_order: dict = {
-        "symbol": symbol,
-        "side": entry_side,
-        "type": "LIMIT",
-        "price": f"{params['entry']:.{dp_p}f}",
-        "quantity": f"{params['qty']:.{dp_q}f}",
-        "timeInForce": "GTC",
-    }
-    if hedge:
-        entry_order["positionSide"] = pos_side
-
-    log.info("Placing Entry (LIMIT) …")
-    entry_result = _signed_post(client, secret, base_url, "/fapi/v1/order", entry_order)
-    entry_id = int(entry_result["orderId"])
-    log.info("  ✓ entry orderId=%s  status=%s", entry_id, entry_result.get("status"))
-
-    # ── 2. Wait for exposure / cancel remainder ───────────────────────────────
-    try:
-        final_entry = _wait_for_entry_exposure(
-            client,
-            secret,
-            base_url,
-            symbol,
-            entry_id,
-            timeout_s=20.0,
-            poll_s=0.5,
-        )
-    except Exception as exc:
-        print(f"\n[ERROR] Could not manage entry order state safely: {exc}")
-        return
-
-    final_status = final_entry.get("status", "?")
-    executed_qty = float(final_entry.get("executedQty", "0"))
-
-    if executed_qty <= 0:
-        print("\nNo position was opened. Entry did not fill.")
-        print(f"Final entry status: {final_status}")
-        return
-
-    if final_status == "FILLED":
-        print("\nEntry filled completely.")
-    else:
-        print("\nEntry filled partially; remaining quantity was canceled.")
-        print(f"Filled quantity: {executed_qty:.{dp_q}f}")
-
-    # Double-check actual open position on exchange
-    current_pos_qty = fetch_position_qty(
-        client,
-        secret,
-        base_url,
-        symbol,
-        hedge,
-        pos_side,
-    )
-
-    if current_pos_qty <= 0:
-        print("\n[WARN] Entry shows executed quantity, but no open position is visible now.")
-        print("Protection orders were not placed.")
-        return
-
-    log.info("Open position confirmed on exchange: qty=%s", current_pos_qty)
-
-    # ── 3. Place SL / TP as Algo orders ────────────────────────────────────────
+    entry_id: int | None = None
     sl_algo_id: int | None = None
     tp_algo_id: int | None = None
 
+    def _cleanup(reason: str) -> None:
+        """Cancel every order we sent so far and exit."""
+        print(f"\n[{reason}] Cancelling open orders for {symbol} …")
+
+        # Cancel unfilled entry (regular order)
+        cancel_all_open_orders(client, secret, base_url, symbol)
+
+        # Cancel any algo orders we managed to place
+        for algo_id in filter(None, [sl_algo_id, tp_algo_id]):
+            try:
+                _cancel_algo_order(client, secret, base_url, algo_id)
+                log.info("Cancelled algo order algoId=%s", algo_id)
+            except Exception as exc:
+                log.warning("Failed to cancel algoId=%s: %s", algo_id, exc)
+
+        print("Cleanup complete. Exiting.")
+
     try:
+        # ── 1. Limit entry ─────────────────────────────────────────────────────
+        entry_order: dict = {
+            "symbol": symbol,
+            "side": entry_side,
+            "type": "LIMIT",
+            "price": f"{params['entry']:.{dp_p}f}",
+            "quantity": f"{params['qty']:.{dp_q}f}",
+            "timeInForce": "GTC",
+        }
+        if hedge:
+            entry_order["positionSide"] = pos_side
+
+        log.info("Placing Entry (LIMIT) …")
+        entry_result = _signed_post(client, secret, base_url, "/fapi/v1/order", entry_order)
+        entry_id = int(entry_result["orderId"])
+        log.info("  ✓ entry orderId=%s  status=%s", entry_id, entry_result.get("status"))
+        print("  (Press Ctrl-C at any time to cancel all orders and abort.)")
+
+        # ── 2. Wait for exposure / cancel remainder ─────────────────────────────
+        try:
+            final_entry = _wait_for_entry_exposure(
+                client, secret, base_url, symbol, entry_id,
+                timeout_s=2000.0, poll_s=0.5,
+            )
+        except KeyboardInterrupt:
+            _cleanup("Ctrl-C during fill wait")
+            sys.exit(0)
+        except Exception as exc:
+            print(f"\n[ERROR] Could not manage entry order state safely: {exc}")
+            return
+
+        final_status = final_entry.get("status", "?")
+        executed_qty = float(final_entry.get("executedQty", "0"))
+
+        if executed_qty <= 0:
+            print("\nNo position was opened. Entry did not fill.")
+            print(f"Final entry status: {final_status}")
+            return
+
+        if final_status == "FILLED":
+            print("\nEntry filled completely.")
+        else:
+            print("\nEntry filled partially; remaining quantity was canceled.")
+            print(f"Filled quantity: {executed_qty:.{dp_q}f}")
+
+        # Double-check actual open position on exchange
+        current_pos_qty = fetch_position_qty(
+            client, secret, base_url, symbol, hedge, pos_side,
+        )
+
+        if current_pos_qty <= 0:
+            print("\n[WARN] Entry shows executed quantity, but no open position is visible now.")
+            print("Protection orders were not placed.")
+            return
+
+        log.info("Open position confirmed on exchange: qty=%s", current_pos_qty)
+
+        # ── 3. Place SL / TP as Algo orders ────────────────────────────────────
         log.info("Placing Stop-loss (STOP_MARKET algo) …")
         sl_result = _place_exit_algo(
-            client,
-            secret,
-            base_url,
-            symbol=symbol,
-            side=close_side,
-            hedge=hedge,
-            position_side=pos_side,
-            order_type="STOP_MARKET",
-            trigger_price=params["sl"],
-            dp_price=dp_p,
+            client, secret, base_url,
+            symbol=symbol, side=close_side, hedge=hedge,
+            position_side=pos_side, order_type="STOP_MARKET",
+            trigger_price=params["sl"], dp_price=dp_p,
         )
         sl_algo_id = int(sl_result["algoId"])
-        log.info(
-            "  ✓ stop-loss algoId=%s  algoStatus=%s",
-            sl_algo_id,
-            sl_result.get("algoStatus", "?"),
-        )
+        log.info("  ✓ stop-loss algoId=%s  algoStatus=%s",
+                 sl_algo_id, sl_result.get("algoStatus", "?"))
 
         log.info("Placing Take-profit (TAKE_PROFIT_MARKET algo) …")
         tp_result = _place_exit_algo(
-            client,
-            secret,
-            base_url,
-            symbol=symbol,
-            side=close_side,
-            hedge=hedge,
-            position_side=pos_side,
-            order_type="TAKE_PROFIT_MARKET",
-            trigger_price=params["tp"],
-            dp_price=dp_p,
+            client, secret, base_url,
+            symbol=symbol, side=close_side, hedge=hedge,
+            position_side=pos_side, order_type="TAKE_PROFIT_MARKET",
+            trigger_price=params["tp"], dp_price=dp_p,
         )
         tp_algo_id = int(tp_result["algoId"])
-        log.info(
-            "  ✓ take-profit algoId=%s  algoStatus=%s",
-            tp_algo_id,
-            tp_result.get("algoStatus", "?"),
-        )
+        log.info("  ✓ take-profit algoId=%s  algoStatus=%s",
+                 tp_algo_id, tp_result.get("algoStatus", "?"))
+
+    except KeyboardInterrupt:
+        _cleanup("Ctrl-C")
+        sys.exit(0)
 
     except Exception as exc:
         log.error("Failed to place protective algo orders: %s", exc)
 
-        if sl_algo_id is not None:
+        # Roll back any algo we managed to place
+        for algo_id in filter(None, [sl_algo_id, tp_algo_id]):
             try:
-                _cancel_algo_order(client, secret, base_url, sl_algo_id)
-            except Exception:
-                pass
-        if tp_algo_id is not None:
-            try:
-                _cancel_algo_order(client, secret, base_url, tp_algo_id)
+                _cancel_algo_order(client, secret, base_url, algo_id)
             except Exception:
                 pass
 
@@ -1039,14 +1059,8 @@ def place_orders(
         print("Attempting emergency market close …")
 
         latest_pos_qty = fetch_position_qty(
-            client,
-            secret,
-            base_url,
-            symbol,
-            hedge,
-            pos_side,
+            client, secret, base_url, symbol, hedge, pos_side,
         )
-
         if latest_pos_qty <= 0:
             print("[SAFE EXIT] No open position detected anymore.")
             return
@@ -1067,7 +1081,6 @@ def place_orders(
             print(f"[SAFE EXIT] Emergency close sent. orderId={emergency.get('orderId')}")
         except Exception as emergency_exc:
             print(f"[DANGER] Emergency close also failed: {emergency_exc}")
-
         return
 
     print("\nProtective orders placed successfully.")
