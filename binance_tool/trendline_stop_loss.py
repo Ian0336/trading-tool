@@ -38,6 +38,17 @@ from urllib.parse import urlencode
 import httpx
 import pandas as pd
 
+# ── Network retry constants ─────────────────────────────────────────────────────
+_RETRY_INITIAL_WAIT_S = 5     # first back-off after a network failure
+_RETRY_MAX_WAIT_S     = 60   # cap for exponential back-off
+_NETWORK_ERRORS       = (
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.TimeoutException,
+    httpx.RemoteProtocolError,
+)
+
 # ── Path bootstrap ─────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -107,30 +118,59 @@ def _sign(params: dict, api_secret: str) -> dict:
     return params
 
 
+def _request_with_retry(fn, *args, **kwargs):
+    """
+    Call ``fn(*args, **kwargs)`` and retry with exponential back-off whenever
+    a transient network error is raised.  Gives up only on KeyboardInterrupt.
+    """
+    wait = _RETRY_INITIAL_WAIT_S
+    attempt = 0
+    while True:
+        try:
+            return fn(*args, **kwargs)
+        except _NETWORK_ERRORS as exc:
+            attempt += 1
+            log.warning(
+                "Network error (attempt %d): %s — retrying in %ds …",
+                attempt, exc, wait,
+            )
+            time.sleep(wait)
+            wait = min(wait + 5, _RETRY_MAX_WAIT_S)
+        except httpx.HTTPStatusError as exc:
+            # Non-2xx from Binance: surface immediately, don't retry
+            raise
+
+
 def _signed_get(client: httpx.Client, api_secret: str,
                 path: str, extra: dict | None = None) -> list | dict:
-    params: dict = {
-        "timestamp":  int(time.time() * 1000),
-        "recvWindow": 5000,
-        **(extra or {}),
-    }
-    _sign(params, api_secret)
-    resp = client.get(f"{BASE_URL}{path}", params=params)
-    resp.raise_for_status()
-    return resp.json()
+    def _do():
+        params: dict = {
+            "timestamp":  int(time.time() * 1000),
+            "recvWindow": 5000,
+            **(extra or {}),
+        }
+        _sign(params, api_secret)
+        resp = client.get(f"{BASE_URL}{path}", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    return _request_with_retry(_do)
 
 
 def _signed_post(client: httpx.Client, api_secret: str,
                  path: str, data: dict | None = None) -> dict:
-    params: dict = {
-        "timestamp":  int(time.time() * 1000),
-        "recvWindow": 5000,
-        **(data or {}),
-    }
-    _sign(params, api_secret)
-    resp = client.post(f"{BASE_URL}{path}", data=params)
-    resp.raise_for_status()
-    return resp.json()
+    def _do():
+        params: dict = {
+            "timestamp":  int(time.time() * 1000),
+            "recvWindow": 5000,
+            **(data or {}),
+        }
+        _sign(params, api_secret)
+        resp = client.post(f"{BASE_URL}{path}", data=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    return _request_with_retry(_do)
 
 
 # ── Position helpers ────────────────────────────────────────────────────────────
@@ -402,6 +442,10 @@ def run_monitor(
 
     except KeyboardInterrupt:
         print("\nMonitoring aborted by user.")
+    except Exception as exc:
+        # Unexpected non-network error — log and re-raise so caller knows
+        log.error("Unexpected error in monitor loop: %s", exc, exc_info=True)
+        raise
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
