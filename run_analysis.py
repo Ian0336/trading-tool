@@ -71,7 +71,7 @@ def main() -> None:
     if len(sys.argv) > 1:
         run_dir = _find_run_dir(sys.argv[1])
     else:
-        run_dir = collect()
+        run_dir = collect(last_n_days=1)
 
     chart_dir = run_dir / "charts"
     chart_dir.mkdir(exist_ok=True)

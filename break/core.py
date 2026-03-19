@@ -370,19 +370,19 @@ def scan_all_breakouts(
             ):
                 line_val = mR * t + bR
                 ts = df["Date"].iloc[t] if "Date" in df.columns else t
-                events.append(
-                    BreakoutEvent(
-                        bar=t,
-                        timestamp=ts,
-                        direction="up",
-                        close=float(df["Close"].iloc[t]),
-                        line_value=line_val,
-                        line_m=mR,
-                        line_b=bR,
-                        atr_value=a_val,
-                        margin=margin_atr * a_val,
-                    )
-                )
+                # events.append(
+                #     BreakoutEvent(
+                #         bar=t,
+                #         timestamp=ts,
+                #         direction="up",
+                #         close=float(df["Close"].iloc[t]),
+                #         line_value=line_val,
+                #         line_m=mR,
+                #         line_b=bR,
+                #         atr_value=a_val,
+                #         margin=margin_atr * a_val,
+                #     )
+                # )
 
         # support
         low_pivs = [
@@ -399,19 +399,19 @@ def scan_all_breakouts(
             ):
                 line_val = mS * t + bS
                 ts = df["Date"].iloc[t] if "Date" in df.columns else t
-                events.append(
-                    BreakoutEvent(
-                        bar=t,
-                        timestamp=ts,
-                        direction="down",
-                        close=float(df["Close"].iloc[t]),
-                        line_value=line_val,
-                        line_m=mS,
-                        line_b=bS,
-                        atr_value=a_val,
-                        margin=margin_atr * a_val,
-                    )
-                )
+                # events.append(
+                #     BreakoutEvent(
+                #         bar=t,
+                #         timestamp=ts,
+                #         direction="down",
+                #         close=float(df["Close"].iloc[t]),
+                #         line_value=line_val,
+                #         line_m=mS,
+                #         line_b=bS,
+                #         atr_value=a_val,
+                #         margin=margin_atr * a_val,
+                #     )
+                # )
 
     events.sort(key=lambda e: e.bar)
     return events
