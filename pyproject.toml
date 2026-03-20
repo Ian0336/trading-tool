@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
 [project]
 name = "trade"
 version = "0.1.0"
@@ -9,3 +13,7 @@ dependencies = [
     "numpy>=2.4.2",
     "pandas>=3.0.1",
 ]
+
+# src/ layout — wheel includes these top-level packages
+[tool.hatch.build.targets.wheel]
+packages = ["src/binance_tool", "src/break", "src/collect_data"]

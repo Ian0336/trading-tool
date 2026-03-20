@@ -19,8 +19,10 @@ from urllib.parse import urlencode
 
 import httpx
 
-# ── Path bootstrap ─────────────────────────────────────────────────────────────
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Repository root (parent of ``src/``) so ``utils.get_keys`` resolves when the
+# repo is not installed as a single top-level package.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_REPO_ROOT))
 
 from utils.get_keys import get_secret  # noqa: E402
 

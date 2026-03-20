@@ -23,7 +23,7 @@ Key design rules
 
 Usage
 -----
-    uv run python binance_tool/trendline_stop_loss.py
+    uv run python -m binance_tool.trendline_stop_loss
 """
 
 from __future__ import annotations
@@ -31,9 +31,6 @@ from __future__ import annotations
 import logging
 import sys
 import time
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import httpx
 import pandas as pd

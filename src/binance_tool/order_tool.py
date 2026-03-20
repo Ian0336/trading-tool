@@ -33,9 +33,9 @@ calls. This script reduces risk by:
 
 Usage
 -----
-    uv run python binance_tool/order_tool.py
-    uv run python binance_tool/order_tool.py --top 30
-    uv run python binance_tool/order_tool.py --testnet
+    uv run python -m binance_tool.order_tool
+    uv run python -m binance_tool.order_tool --top 30
+    uv run python -m binance_tool.order_tool --testnet
 """
 
 from __future__ import annotations
@@ -45,9 +45,6 @@ import logging
 import math
 import sys
 import time
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import httpx
 
