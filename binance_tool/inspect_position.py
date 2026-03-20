@@ -1,95 +1,23 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import hmac
-import hashlib
 import json
 import sys
-import time
 from pathlib import Path
-from urllib.parse import urlencode
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import httpx
 
-# 讓你沿用現有的 get_secret()
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from utils.get_keys import get_secret  # noqa: E402
-
-
-LIVE_BASE = "https://fapi.binance.com"
-TESTNET_BASE = "https://demo-fapi.binance.com"
-
-
-def load_credentials() -> tuple[str, str]:
-    api_key = get_secret("Binance_API_Key", "trading-tool")
-    api_secret = get_secret("Binance_API_Secret", "trading-tool")
-
-    if not api_key or not api_secret:
-        print("[ERROR] 無法從 macOS Keychain 讀取 Binance API Key / Secret")
-        print("請確認你之前 order_tool.py 用的是同一組 key。")
-        sys.exit(1)
-
-    return api_key, api_secret
-
-
-def sign_params(params: dict, secret: str) -> dict:
-    query = urlencode(params, doseq=True)
-    sig = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
-    params["signature"] = sig
-    return params
-
-
-def raise_for_status(resp: httpx.Response) -> None:
-    if resp.is_error:
-        try:
-            body = resp.json()
-            code = body.get("code", "?")
-            msg = body.get("msg", resp.text)
-        except Exception:
-            code = "?"
-            msg = resp.text
-        raise httpx.HTTPStatusError(
-            f"HTTP {resp.status_code}  Binance code={code}: {msg}",
-            request=resp.request,
-            response=resp,
-        )
-
-
-def signed_get(client: httpx.Client, secret: str, base_url: str, path: str, extra: dict | None = None):
-    params = {
-        "timestamp": int(time.time() * 1000),
-        "recvWindow": 5000,
-        **(extra or {}),
-    }
-    sign_params(params, secret)
-    resp = client.get(f"{base_url}{path}", params=params)
-    raise_for_status(resp)
-    return resp.json()
-
-
-def split_symbol(symbol: str) -> tuple[str, str]:
-    for quote in ("USDC", "USDT", "BUSD"):
-        if symbol.endswith(quote):
-            return symbol[:-len(quote)], quote
-    return symbol, ""
-
-
-def fetch_positions(client: httpx.Client, secret: str, base_url: str) -> list[dict]:
-    data = signed_get(client, secret, base_url, "/fapi/v3/positionRisk")
-    if isinstance(data, dict):
-        data = [data]
-
-    positions: list[dict] = []
-    for row in data:
-        try:
-            amt = float(row.get("positionAmt", "0"))
-        except Exception:
-            amt = 0.0
-
-        if abs(amt) > 0:
-            positions.append(row)
-
-    return positions
+from binance_tool.shared import (
+    LIVE_BASE,
+    TESTNET_BASE,
+    build_client,
+    fetch_open_positions,
+    load_credentials,
+    signed_get,
+    split_symbol,
+)
 
 
 def fetch_open_orders(client: httpx.Client, secret: str, base_url: str, symbol: str) -> list[dict]:
@@ -219,8 +147,8 @@ def main() -> None:
 
     api_key, api_secret = load_credentials()
 
-    with httpx.Client(headers={"X-MBX-APIKEY": api_key}, timeout=10) as client:
-        positions = fetch_positions(client, api_secret, base_url)
+    with build_client(api_key) as client:
+        positions = fetch_open_positions(client, api_secret, base_url)
 
         if not positions:
             print("目前沒有非 0 倉位。")

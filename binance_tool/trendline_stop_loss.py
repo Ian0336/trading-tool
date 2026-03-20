@@ -8,8 +8,10 @@ Trendline Stop-Loss Monitor
      • Two anchor points, each given as (price, N bars ago).
      • Slope = Δprice / Δbars  (price per bar), then converted to price/ms
        so the line can be evaluated at any future moment.
-4. Polls mark price every 60 s; fires a market close order when price crosses
-   the extrapolated line.
+4. Places a STOP_MARKET algo order on the exchange at the current trendline
+   price, then refreshes it every 15 minutes so the order always tracks the
+   moving trendline.  Any existing STOP_MARKET algo order for the symbol
+   (e.g. one placed by order_tool.py) is replaced on each refresh cycle.
 
 Key design rules
 ----------------
@@ -26,33 +28,29 @@ Usage
 
 from __future__ import annotations
 
-import hmac
-import hashlib
 import logging
 import sys
 import time
-from datetime import timezone
 from pathlib import Path
-from urllib.parse import urlencode
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import httpx
 import pandas as pd
 
-# ── Network retry constants ─────────────────────────────────────────────────────
-_RETRY_INITIAL_WAIT_S = 5     # first back-off after a network failure
-_RETRY_MAX_WAIT_S     = 60   # cap for exponential back-off
-_NETWORK_ERRORS       = (
-    httpx.ConnectError,
-    httpx.ReadError,
-    httpx.WriteError,
-    httpx.TimeoutException,
-    httpx.RemoteProtocolError,
+from binance_tool.shared import (
+    LIVE_BASE,
+    build_client,
+    decimal_places,
+    fetch_open_positions,
+    is_hedge_mode,
+    load_credentials,
+    public_get,
+    round_price,
+    signed_delete,
+    signed_get,
+    signed_post,
 )
-
-# ── Path bootstrap ─────────────────────────────────────────────────────────────
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from utils.get_keys import get_secret
 
 DISPLAY_TZ = "Asia/Taipei"   # UTC+8
 
@@ -64,8 +62,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Binance Futures constants ──────────────────────────────────────────────────
-BASE_URL = "https://fapi.binance.com"
+# ── Constants ─────────────────────────────────────────────────────────────────
+BASE_URL = LIVE_BASE
 
 _INTERVAL_MS: dict[str, int] = {
     "1m":  60_000,
@@ -79,114 +77,99 @@ _INTERVAL_MS: dict[str, int] = {
 }
 
 
-# ── Credentials ────────────────────────────────────────────────────────────────
+# ── Exchange-info helper ──────────────────────────────────────────────────────
 
-def _load_credentials() -> tuple[str, str]:
-    """Load API key and secret from macOS Keychain."""
-    api_key = get_secret("Binance_API_Key", "trading-tool")
-    api_secret = get_secret("Binance_API_Secret", "trading-tool")
-
-    missing: list[str] = []
-    if not api_key:
-        missing.append("API key  (service='Binance_API_Key',    account='trading-tool')")
-    if not api_secret:
-        missing.append("API secret (service='Binance_API_Secret', account='trading-tool')")
-
-    if missing:
-        print("[ERROR] Could not load from macOS Keychain:")
-        for m in missing:
-            print(f"  • {m}")
-        print("\nTo add them, run:")
-        print("  security add-generic-password -s Binance_API_Key    -a trading-tool -w <KEY>")
-        print("  security add-generic-password -s Binance_API_Secret -a trading-tool -w <SECRET>")
-        sys.exit(1)
-
-    return api_key, api_secret
-
-
-# ── Signed HTTP helpers ────────────────────────────────────────────────────────
-
-def _build_client(api_key: str) -> httpx.Client:
-    return httpx.Client(headers={"X-MBX-APIKEY": api_key}, timeout=10)
-
-
-def _sign(params: dict, api_secret: str) -> dict:
-    """Append HMAC-SHA256 signature in-place and return the dict."""
-    query = urlencode(params, doseq=True)
-    sig = hmac.new(api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
-    params["signature"] = sig
-    return params
-
-
-def _request_with_retry(fn, *args, **kwargs):
-    """
-    Call ``fn(*args, **kwargs)`` and retry with exponential back-off whenever
-    a transient network error is raised.  Gives up only on KeyboardInterrupt.
-    """
-    wait = _RETRY_INITIAL_WAIT_S
-    attempt = 0
-    while True:
-        try:
-            return fn(*args, **kwargs)
-        except _NETWORK_ERRORS as exc:
-            attempt += 1
-            log.warning(
-                "Network error (attempt %d): %s — retrying in %ds …",
-                attempt, exc, wait,
-            )
-            time.sleep(wait)
-            wait = min(wait + 5, _RETRY_MAX_WAIT_S)
-        except httpx.HTTPStatusError as exc:
-            # Non-2xx from Binance: surface immediately, don't retry
-            raise
-
-
-def _signed_get(client: httpx.Client, api_secret: str,
-                path: str, extra: dict | None = None) -> list | dict:
-    def _do():
-        params: dict = {
-            "timestamp":  int(time.time() * 1000),
-            "recvWindow": 5000,
-            **(extra or {}),
-        }
-        _sign(params, api_secret)
-        resp = client.get(f"{BASE_URL}{path}", params=params)
-        resp.raise_for_status()
-        return resp.json()
-
-    return _request_with_retry(_do)
-
-
-def _signed_post(client: httpx.Client, api_secret: str,
-                 path: str, data: dict | None = None) -> dict:
-    def _do():
-        params: dict = {
-            "timestamp":  int(time.time() * 1000),
-            "recvWindow": 5000,
-            **(data or {}),
-        }
-        _sign(params, api_secret)
-        resp = client.post(f"{BASE_URL}{path}", data=params)
-        resp.raise_for_status()
-        return resp.json()
-
-    return _request_with_retry(_do)
-
-
-# ── Position helpers ────────────────────────────────────────────────────────────
-
-def fetch_open_positions(client: httpx.Client, secret: str) -> list[dict]:
-    """Return all positions with a non-zero positionAmt."""
-    all_pos = _signed_get(client, secret, "/fapi/v3/positionRisk")
-    assert isinstance(all_pos, list)
-    return [p for p in all_pos if float(p["positionAmt"]) != 0.0]
-
-
-def is_hedge_mode(client: httpx.Client, secret: str) -> bool:
-    """Return True when account is in Hedge Mode (dual side)."""
-    data = _signed_get(client, secret, "/fapi/v1/positionSide/dual")
+def fetch_price_tick(symbol: str) -> str:
+    """Return the PRICE_FILTER tickSize string for *symbol*."""
+    data = public_get(BASE_URL, "/fapi/v1/exchangeInfo")
     assert isinstance(data, dict)
-    return bool(data.get("dualSidePosition", False))
+    for sym in data.get("symbols", []):
+        if sym["symbol"] != symbol:
+            continue
+        for f in sym.get("filters", []):
+            if f.get("filterType") == "PRICE_FILTER":
+                return f["tickSize"]
+    raise ValueError(f"PRICE_FILTER not found for {symbol}")
+
+
+# ── Algo-order helpers ──────────────────────────────────────────────────────────
+
+def fetch_open_algo_stop_orders(
+    client: httpx.Client, secret: str, symbol: str
+) -> list[dict]:
+    """
+    Return all open STOP_MARKET algo orders for *symbol*.
+    Includes orders placed by order_tool.py or this script.
+    """
+    data = signed_get(client, secret, BASE_URL,
+                      "/fapi/v1/openAlgoOrders",
+                      {"symbol": symbol}, retry=True)
+    orders: list[dict] = []
+    if isinstance(data, dict):
+        orders = data.get("orders", [])
+    elif isinstance(data, list):
+        orders = data
+    return [o for o in orders if o.get("type") in {"STOP_MARKET", "STOP"}]
+
+
+def cancel_algo_order(
+    client: httpx.Client, secret: str, algo_id: int
+) -> None:
+    """Cancel an algo order by *algoId*, ignoring "already terminal" errors."""
+    try:
+        signed_delete(client, secret, BASE_URL,
+                      "/fapi/v1/algoOrder",
+                      {"algoId": algo_id}, retry=True)
+        log.info("Cancelled algo order algoId=%s", algo_id)
+    except httpx.HTTPStatusError as exc:
+        body = exc.response.text if exc.response is not None else ""
+        if "2011" in body or "2034" in body:
+            log.info("Algo order algoId=%s already terminal (ignored).", algo_id)
+        else:
+            log.warning("Failed to cancel algoId=%s: %s", algo_id, exc)
+
+
+def place_stop_algo_order(
+    client: httpx.Client,
+    secret: str,
+    pos: dict,
+    hedge: bool,
+    trigger_price: float,
+    tick_size: str,
+) -> dict:
+    """
+    Place a STOP_MARKET algo order (closePosition=true) that protects *pos*.
+
+    - LONG  → SELL stop triggers when mark price ≤ trigger_price
+    - SHORT → BUY  stop triggers when mark price ≥ trigger_price
+    """
+    amt     = float(pos["positionAmt"])
+    symbol  = pos["symbol"]
+    side    = "SELL" if amt > 0 else "BUY"
+    dp      = decimal_places(tick_size)
+    price_s = f"{round_price(trigger_price, tick_size):.{dp}f}"
+
+    order: dict = {
+        "algoType":      "CONDITIONAL",
+        "symbol":        symbol,
+        "side":          side,
+        "type":          "STOP_MARKET",
+        "triggerPrice":  price_s,
+        "workingType":   "MARK_PRICE",
+        "closePosition": "true",
+    }
+
+    if hedge:
+        order["positionSide"] = pos.get("positionSide", "BOTH")
+
+    result = signed_post(client, secret, BASE_URL,
+                         "/fapi/v1/algoOrder", order, retry=True)
+    assert isinstance(result, dict)
+    log.info(
+        "Placed STOP_MARKET algo  algoId=%s  triggerPrice=%s  side=%s",
+        result.get("algoId"), price_s, side,
+    )
+    return result
 
 
 # ── Bar-index helpers ──────────────────────────────────────────────────────────
@@ -235,36 +218,6 @@ def line_price_at(t1_ms: int, p1: float, t2_ms: int, p2: float, now_ms: int) -> 
         return p1
     slope = (p2 - p1) / (t2_ms - t1_ms)   # price per millisecond
     return p1 + slope * (now_ms - t1_ms)
-
-
-# ── Close-order helper ─────────────────────────────────────────────────────────
-
-def close_position(
-    client: httpx.Client,
-    secret: str,
-    pos: dict,
-    hedge: bool,
-) -> dict:
-    """Place a MARKET order that fully closes the given position."""
-    symbol = pos["symbol"]
-    amt    = float(pos["positionAmt"])
-    side   = "SELL" if amt > 0 else "BUY"
-    qty    = abs(amt)
-
-    order: dict = {
-        "symbol":   symbol,
-        "side":     side,
-        "type":     "MARKET",
-        "quantity": qty,
-    }
-
-    if hedge:
-        # In Hedge Mode positionSide is mandatory and reduceOnly is forbidden
-        order["positionSide"] = pos.get("positionSide", "BOTH")
-    else:
-        order["reduceOnly"] = "true"
-
-    return _signed_post(client, secret, "/fapi/v1/order", order)
 
 
 # ── Interactive prompts ─────────────────────────────────────────────────────────
@@ -352,7 +305,6 @@ def prompt_trendline_points(interval: str) -> tuple[tuple[int, float], tuple[int
         print("[ERROR] Both points land on the same bar — cannot define a line.")
         sys.exit(1)
 
-    # Ensure chronological order regardless of input sequence
     t1_ms, p1 = min(a, b, key=lambda x: x[0])
     t2_ms, p2 = max(a, b, key=lambda x: x[0])
     return (t1_ms, p1), (t2_ms, p2)
@@ -371,7 +323,9 @@ def _refresh_mark_price(
     Refresh mark price for the monitored position.
     Returns None if the position has been closed externally.
     """
-    data = _signed_get(client, secret, "/fapi/v3/positionRisk", {"symbol": symbol})
+    data = signed_get(client, secret, BASE_URL,
+                      "/fapi/v3/positionRisk",
+                      {"symbol": symbol}, retry=True)
     assert isinstance(data, list)
 
     for cp in data:
@@ -380,10 +334,44 @@ def _refresh_mark_price(
         if hedge and cp.get("positionSide") != pos_side:
             continue
         if float(cp["positionAmt"]) == 0.0:
-            return None         # position already closed
+            return None
         return float(cp["markPrice"])
 
-    return None     # no matching row → position closed
+    return None
+
+
+def _refresh_algo_stop(
+    client: httpx.Client,
+    secret: str,
+    pos: dict,
+    hedge: bool,
+    tick_size: str,
+    t1_ms: int,
+    p1: float,
+    t2_ms: int,
+    p2: float,
+    current_algo_id: int | None,
+) -> int | None:
+    """
+    Cancel any existing STOP_MARKET algo orders for the symbol (including ones
+    placed by order_tool.py), then place a fresh order at the current trendline
+    price.  Returns the new algoId, or None if placement fails.
+    """
+    symbol  = pos["symbol"]
+    now_ms  = int(time.time() * 1000)
+    line_px = line_price_at(t1_ms, p1, t2_ms, p2, now_ms)
+
+    existing = fetch_open_algo_stop_orders(client, secret, symbol)
+    for o in existing:
+        cancel_algo_order(client, secret, int(o["algoId"]))
+
+    try:
+        result = place_stop_algo_order(client, secret, pos, hedge,
+                                       line_px, tick_size)
+        return int(result["algoId"])
+    except httpx.HTTPStatusError as exc:
+        log.error("Failed to place algo stop order: %s", exc)
+        return None
 
 
 def run_monitor(
@@ -396,54 +384,84 @@ def run_monitor(
     t2_ms: int,
     p2: float,
     poll_interval_s: int = 60,
+    update_interval_s: int = 900,   # 15 minutes
 ) -> None:
+    """
+    Monitor a position protected by a trendline stop-loss.
+
+    Strategy
+    --------
+    1. On entry (and every *update_interval_s* seconds), cancel any open
+       STOP_MARKET algo orders for the symbol and place a new one at the
+       current trendline price.  This keeps the exchange-side stop in sync
+       with the moving trendline.
+    2. Poll every *poll_interval_s* seconds to check whether the position
+       still exists.  When it disappears (closed by the algo stop or
+       manually), the loop exits and any remaining algo order is cleaned up.
+    """
     symbol   = pos["symbol"]
     amt      = float(pos["positionAmt"])
     is_long  = amt > 0
     pos_side = pos.get("positionSide", "BOTH")
 
-    direction = "≤ (below or at)" if is_long else "≥ (above or at)"
     print(f"\n{'=' * 60}")
     print(f"  Monitoring  {symbol}  ({'LONG' if is_long else 'SHORT'})")
     print(f"  Trend line anchors (UTC+8):")
     print(f"    Point 1: {ms_to_display(t1_ms)}  →  {p1:.6g}")
     print(f"    Point 2: {ms_to_display(t2_ms)}  →  {p2:.6g}")
-    print(f"  Stop fires when mark price {direction} line value")
-    print(f"  Poll every {poll_interval_s}s  |  Ctrl-C to abort")
+    print(f"  Stop order refreshed every {update_interval_s // 60} min  "
+          f"|  position polled every {poll_interval_s}s  |  Ctrl-C to abort")
     print(f"{'=' * 60}\n")
+
+    log.info("Fetching price tick size for %s …", symbol)
+    tick_size = fetch_price_tick(symbol)
+
+    current_algo_id: int | None = None
+    last_update_t = 0.0   # force an immediate refresh on the first iteration
 
     try:
         while True:
-            now_ms  = int(time.time() * 1000)
-            line_px = line_price_at(t1_ms, p1, t2_ms, p2, now_ms)
+            now = time.monotonic()
 
+            # ── Refresh algo stop every update_interval_s ───────────────────
+            if now - last_update_t >= update_interval_s:
+                now_ms  = int(time.time() * 1000)
+                line_px = line_price_at(t1_ms, p1, t2_ms, p2, now_ms)
+                log.info(
+                    "Refreshing STOP_MARKET algo  trendline=%.4f  (every %dm)",
+                    line_px, update_interval_s // 60,
+                )
+                current_algo_id = _refresh_algo_stop(
+                    client, secret, pos, hedge, tick_size,
+                    t1_ms, p1, t2_ms, p2, current_algo_id,
+                )
+                last_update_t = now
+
+            # ── Check whether position is still open ────────────────────────
             mark_px = _refresh_mark_price(client, secret, symbol, pos_side, hedge)
             if mark_px is None:
-                log.warning("Position %s no longer found — may already be closed.", symbol)
-                break
-
-            triggered = (is_long and mark_px <= line_px) or (not is_long and mark_px >= line_px)
-
-            status = "*** TRIGGER ***" if triggered else ""
-            log.info(
-                "%s  mark=%.4f  line=%.4f  %s",
-                symbol, mark_px, line_px, status,
-            )
-
-            if triggered:
-                log.warning("Stop-loss line hit! Placing market close order …")
-                result = close_position(client, secret, pos, hedge)
-                log.info("Order result: orderId=%s  status=%s",
-                         result.get("orderId"), result.get("status"))
+                log.info("Position %s no longer open — stop fired or closed manually.", symbol)
                 print("\nPosition closed. Exiting.")
                 break
+
+            now_ms  = int(time.time() * 1000)
+            line_px = line_price_at(t1_ms, p1, t2_ms, p2, now_ms)
+            next_refresh_s = max(0, update_interval_s - (time.monotonic() - last_update_t))
+            log.info(
+                "%s  mark=%.4f  line=%.4f  algoId=%s  next_refresh_in=%ds",
+                symbol, mark_px, line_px,
+                current_algo_id if current_algo_id else "—",
+                int(next_refresh_s),
+            )
 
             time.sleep(poll_interval_s)
 
     except KeyboardInterrupt:
         print("\nMonitoring aborted by user.")
+        if current_algo_id is not None:
+            log.info("Cancelling algo stop order algoId=%s …", current_algo_id)
+            cancel_algo_order(client, secret, current_algo_id)
     except Exception as exc:
-        # Unexpected non-network error — log and re-raise so caller knows
         log.error("Unexpected error in monitor loop: %s", exc, exc_info=True)
         raise
 
@@ -451,17 +469,17 @@ def run_monitor(
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    api_key, api_secret = _load_credentials()
+    api_key, api_secret = load_credentials()
 
-    with _build_client(api_key) as client:
+    with build_client(api_key) as client:
         log.info("Fetching open positions …")
-        positions = fetch_open_positions(client, api_secret)
+        positions = fetch_open_positions(client, api_secret, BASE_URL, retry=True)
 
         if not positions:
             print("No open positions found.")
             return
 
-        hedge = is_hedge_mode(client, api_secret)
+        hedge = is_hedge_mode(client, api_secret, BASE_URL, retry=True)
         log.info("Account mode: %s", "Hedge" if hedge else "One-way")
 
         selected = prompt_select_position(positions)
@@ -476,7 +494,12 @@ def main() -> None:
 
         input("\nPress Enter to start monitoring (Ctrl-C to abort) … ")
 
-        run_monitor(client, api_secret, selected, hedge, t1_ms, p1, t2_ms, p2)
+        run_monitor(
+            client, api_secret, selected, hedge,
+            t1_ms, p1, t2_ms, p2,
+            poll_interval_s=60,
+            update_interval_s=900,
+        )
 
 
 if __name__ == "__main__":

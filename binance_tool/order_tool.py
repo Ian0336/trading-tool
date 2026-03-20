@@ -41,22 +41,31 @@ Usage
 from __future__ import annotations
 
 import argparse
-import hmac
-import hashlib
 import logging
 import math
 import sys
 import time
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path
-from urllib.parse import urlencode
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import httpx
 
-# ── Path bootstrap ─────────────────────────────────────────────────────────────
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from utils.get_keys import get_secret
+from binance_tool.shared import (
+    LIVE_BASE,
+    TESTNET_BASE,
+    build_client,
+    decimal_places,
+    floor_qty,
+    is_hedge_mode,
+    load_credentials,
+    public_get,
+    round_price,
+    signed_delete,
+    signed_get,
+    signed_post,
+    split_symbol,
+)
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -65,152 +74,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
-
-# ── Constants ──────────────────────────────────────────────────────────────────
-LIVE_BASE = "https://fapi.binance.com"
-TESTNET_BASE = "https://demo-fapi.binance.com"
-
-
-# ── Credentials ────────────────────────────────────────────────────────────────
-
-def _load_credentials() -> tuple[str, str]:
-    """Load API key and secret from macOS Keychain."""
-    api_key = get_secret("Binance_API_Key", "trading-tool")
-    api_secret = get_secret("Binance_API_Secret", "trading-tool")
-
-    missing: list[str] = []
-    if not api_key:
-        missing.append("service='Binance_API_Key'    account='trading-tool'")
-    if not api_secret:
-        missing.append("service='Binance_API_Secret' account='trading-tool'")
-
-    if missing:
-        print("[ERROR] Cannot load credentials from macOS Keychain:")
-        for m in missing:
-            print(f"  • {m}")
-        print("\nTo store them, run:")
-        print("  security add-generic-password -s Binance_API_Key    -a trading-tool -w <KEY>")
-        print("  security add-generic-password -s Binance_API_Secret -a trading-tool -w <SECRET>")
-        sys.exit(1)
-
-    return api_key, api_secret
-
-
-# ── Symbol helpers ─────────────────────────────────────────────────────────────
-
-def split_symbol(symbol: str) -> tuple[str, str]:
-    """Return (base_asset, quote_asset) for common USDⓈ-M symbols."""
-    for quote in ("USDC", "USDT", "BUSD"):
-        if symbol.endswith(quote):
-            return symbol[:-len(quote)], quote
-    return symbol, ""
-
-
-# ── HTTP helpers ───────────────────────────────────────────────────────────────
-
-def _build_client(api_key: str) -> httpx.Client:
-    return httpx.Client(headers={"X-MBX-APIKEY": api_key}, timeout=10)
-
-
-def _sign(params: dict, secret: str) -> dict:
-    """Append HMAC-SHA256 signature in-place and return the dict."""
-    query = urlencode(params, doseq=True)
-    sig = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
-    params["signature"] = sig
-    return params
-
-
-def _raise_for_status(resp: httpx.Response) -> None:
-    """
-    Like raise_for_status() but includes the Binance JSON error body so the
-    actual error code and message are visible instead of just the HTTP status.
-    """
-    if resp.is_error:
-        try:
-            body = resp.json()
-            code = body.get("code", "?")
-            msg = body.get("msg", resp.text)
-        except Exception:
-            code = "?"
-            msg = resp.text
-
-        if resp.status_code == 401:
-            print(
-                f"\n[401 Unauthorized]  Binance code={code}: {msg}\n"
-                "  Possible causes:\n"
-                "  • API key not enabled for USDⓈ-M Futures trading\n"
-                "  • Wrong key/secret stored in Keychain\n"
-                "  • Key is IP-restricted and this machine is not whitelisted\n"
-                "  Check: Binance → API Management → Edit Restrictions"
-            )
-            sys.exit(1)
-
-        raise httpx.HTTPStatusError(
-            f"HTTP {resp.status_code}  Binance code={code}: {msg}",
-            request=resp.request,
-            response=resp,
-        )
-
-
-def _public_get(base_url: str, path: str, params: dict | None = None) -> list | dict:
-    with httpx.Client(timeout=10) as c:
-        resp = c.get(f"{base_url}{path}", params=params or {})
-        _raise_for_status(resp)
-        return resp.json()
-
-
-def _signed_get(
-    client: httpx.Client,
-    secret: str,
-    base_url: str,
-    path: str,
-    extra: dict | None = None,
-) -> list | dict:
-    params: dict = {
-        "timestamp": int(time.time() * 1000),
-        "recvWindow": 5000,
-        **(extra or {}),
-    }
-    _sign(params, secret)
-    resp = client.get(f"{base_url}{path}", params=params)
-    _raise_for_status(resp)
-    return resp.json()
-
-
-def _signed_post(
-    client: httpx.Client,
-    secret: str,
-    base_url: str,
-    path: str,
-    data: dict,
-) -> dict:
-    params: dict = {
-        "timestamp": int(time.time() * 1000),
-        "recvWindow": 5000,
-        **data,
-    }
-    _sign(params, secret)
-    resp = client.post(f"{base_url}{path}", data=params)
-    _raise_for_status(resp)
-    return resp.json()
-
-
-def _signed_delete(
-    client: httpx.Client,
-    secret: str,
-    base_url: str,
-    path: str,
-    extra: dict | None = None,
-) -> dict | list:
-    params: dict = {
-        "timestamp": int(time.time() * 1000),
-        "recvWindow": 5000,
-        **(extra or {}),
-    }
-    _sign(params, secret)
-    resp = client.delete(f"{base_url}{path}", params=params)
-    _raise_for_status(resp)
-    return resp.json()
 
 
 # ── Exchange info / symbol rules ───────────────────────────────────────────────
@@ -228,7 +91,7 @@ def fetch_symbol_rules(base_url: str, symbol: str) -> dict:
     max_qty        : float
     order_types    : set[str]
     """
-    data = _public_get(base_url, "/fapi/v1/exchangeInfo")
+    data = public_get(base_url, "/fapi/v1/exchangeInfo")
     assert isinstance(data, dict)
 
     for sym in data.get("symbols", []):
@@ -269,7 +132,7 @@ def fetch_top_volume(base_url: str, n: int = 20) -> list[dict]:
     Return the top-n USDC-margined USDⓈ-M symbols ranked by 24 h quote volume.
     Each element has: symbol, lastPrice, quoteVolume, priceChangePercent.
     """
-    tickers = _public_get(base_url, "/fapi/v1/ticker/24hr")
+    tickers = public_get(base_url, "/fapi/v1/ticker/24hr")
     assert isinstance(tickers, list)
 
     usdc = [t for t in tickers if t["symbol"].endswith("USDC")]
@@ -277,35 +140,7 @@ def fetch_top_volume(base_url: str, n: int = 20) -> list[dict]:
     return usdc[:n]
 
 
-# ── Precision helpers ──────────────────────────────────────────────────────────
-
-def _decimal_places(tick: str) -> int:
-    """Return the number of decimal places implied by a tick/step string."""
-    d = Decimal(tick)
-    return max(0, -d.as_tuple().exponent)
-
-
-def round_price(price: float, tick_size: str) -> float:
-    """Round price to the nearest tick_size using Decimal math."""
-    tick = Decimal(tick_size)
-    result = (Decimal(str(price)) / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick
-    return float(result)
-
-
-def floor_qty(qty: float, step_size: str) -> float:
-    """Floor quantity to the nearest step_size (always round down)."""
-    step = Decimal(step_size)
-    result = (Decimal(str(qty)) / step).quantize(Decimal("1"), rounding=ROUND_DOWN) * step
-    return float(result)
-
-
 # ── Account / position helpers ─────────────────────────────────────────────────
-
-def is_hedge_mode(client: httpx.Client, secret: str, base_url: str) -> bool:
-    data = _signed_get(client, secret, base_url, "/fapi/v1/positionSide/dual")
-    assert isinstance(data, dict)
-    return bool(data.get("dualSidePosition", False))
-
 
 def fetch_available_balance(
     client: httpx.Client,
@@ -316,7 +151,7 @@ def fetch_available_balance(
     """
     Return the availableBalance for the given *asset* from GET /fapi/v3/account.
     """
-    account = _signed_get(client, secret, base_url, "/fapi/v3/account")
+    account = signed_get(client, secret, base_url, "/fapi/v3/account")
     assert isinstance(account, dict)
     for asset_info in account.get("assets", []):
         if asset_info.get("asset") == asset:
@@ -333,7 +168,7 @@ def fetch_max_leverage(
     """
     Return the maximum allowed leverage for *symbol* at the first bracket.
     """
-    data = _signed_get(
+    data = signed_get(
         client,
         secret,
         base_url,
@@ -361,7 +196,7 @@ def set_leverage(
     leverage: int,
 ) -> None:
     """Call POST /fapi/v1/leverage to set leverage for *symbol*."""
-    result = _signed_post(
+    result = signed_post(
         client,
         secret,
         base_url,
@@ -389,7 +224,7 @@ def fetch_position_qty(
     In One-way mode, reads the BOTH position.
     In Hedge mode, reads the requested LONG/SHORT side.
     """
-    data = _signed_get(
+    data = signed_get(
         client,
         secret,
         base_url,
@@ -425,7 +260,7 @@ def ensure_no_existing_position(
     This tool uses closePosition=true for protection, so mixing with an existing
     position is dangerous.
     """
-    data = _signed_get(
+    data = signed_get(
         client,
         secret,
         base_url,
@@ -569,7 +404,7 @@ def prompt_direction() -> str:
 
 def _ask_price(prompt_text: str, tick_size: str) -> float:
     """Read a price from stdin, round to tick_size, and return it."""
-    dp = _decimal_places(tick_size)
+    dp = decimal_places(tick_size)
     while True:
         raw = input(prompt_text).strip()
         try:
@@ -613,8 +448,8 @@ def prompt_trade_params(
     is_long = direction == "LONG"
     tick = rules["tick_size"]
     step = rules["step_size"]
-    dp_price = _decimal_places(tick)
-    dp_qty = _decimal_places(step)
+    dp_price = decimal_places(tick)
+    dp_qty = decimal_places(step)
 
     print(f"\n  Current mark price ≈ {last_price:g}")
     print(
@@ -740,7 +575,7 @@ def _query_order(
     symbol: str,
     order_id: int,
 ) -> dict:
-    data = _signed_get(
+    data = signed_get(
         client,
         secret,
         base_url,
@@ -758,7 +593,7 @@ def _cancel_order(
     symbol: str,
     order_id: int,
 ) -> dict:
-    data = _signed_delete(
+    data = signed_delete(
         client,
         secret,
         base_url,
@@ -780,11 +615,10 @@ def cancel_all_open_orders(
     Silently ignores "no open orders" responses.
     """
     try:
-        _signed_delete(client, secret, base_url,
-                       "/fapi/v1/allOpenOrders", {"symbol": symbol})
+        signed_delete(client, secret, base_url,
+                      "/fapi/v1/allOpenOrders", {"symbol": symbol})
         log.info("All open regular orders for %s cancelled.", symbol)
     except httpx.HTTPStatusError as exc:
-        # -2011 = "Unknown order" / nothing to cancel — safe to ignore
         if "code=-2011" in str(exc) or "code=-1013" in str(exc):
             log.info("No open regular orders to cancel for %s.", symbol)
         else:
@@ -797,7 +631,7 @@ def _cancel_algo_order(
     base_url: str,
     algo_id: int,
 ) -> dict:
-    data = _signed_delete(
+    data = signed_delete(
         client,
         secret,
         base_url,
@@ -903,7 +737,7 @@ def _place_exit_algo(
     if hedge:
         order["positionSide"] = position_side
 
-    result = _signed_post(client, secret, base_url, "/fapi/v1/algoOrder", order)
+    result = signed_post(client, secret, base_url, "/fapi/v1/algoOrder", order)
     assert isinstance(result, dict)
     return result
 
@@ -974,7 +808,7 @@ def place_orders(
             entry_order["positionSide"] = pos_side
 
         log.info("Placing Entry (LIMIT) …")
-        entry_result = _signed_post(client, secret, base_url, "/fapi/v1/order", entry_order)
+        entry_result = signed_post(client, secret, base_url, "/fapi/v1/order", entry_order)
         entry_id = int(entry_result["orderId"])
         log.info("  ✓ entry orderId=%s  status=%s", entry_id, entry_result.get("status"))
         print("  (Press Ctrl-C at any time to cancel all orders and abort.)")
@@ -1077,7 +911,7 @@ def place_orders(
             emergency_order["reduceOnly"] = "true"
 
         try:
-            emergency = _signed_post(client, secret, base_url, "/fapi/v1/order", emergency_order)
+            emergency = signed_post(client, secret, base_url, "/fapi/v1/order", emergency_order)
             print(f"[SAFE EXIT] Emergency close sent. orderId={emergency.get('orderId')}")
         except Exception as emergency_exc:
             print(f"[DANGER] Emergency close also failed: {emergency_exc}")
@@ -1115,7 +949,7 @@ def main() -> None:
     if args.testnet:
         log.info("*** TESTNET MODE — no real orders will be placed ***")
 
-    api_key, api_secret = _load_credentials()
+    api_key, api_secret = load_credentials()
 
     # 1. Volume ranking
     log.info("Fetching top-%d symbols by 24 h volume …", args.top)
@@ -1143,7 +977,7 @@ def main() -> None:
         print("Cancelled.")
         return
 
-    with _build_client(api_key) as client:
+    with build_client(api_key) as client:
         # 6. Account mode
         hedge = is_hedge_mode(client, api_secret, base_url)
         log.info("Account mode: %s", "Hedge" if hedge else "One-way")
