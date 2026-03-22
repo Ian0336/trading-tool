@@ -106,7 +106,11 @@ def fetch_open_algo_stop_orders(
         orders = data.get("orders", [])
     elif isinstance(data, list):
         orders = data
-    return [o for o in orders if o.get("type") in {"STOP_MARKET", "STOP"}]
+    # Binance algo orders use "orderType", not "type"
+    return [
+        o for o in orders
+        if o.get("orderType", o.get("type")) in {"STOP_MARKET", "STOP"}
+    ]
 
 
 def cancel_algo_order(
