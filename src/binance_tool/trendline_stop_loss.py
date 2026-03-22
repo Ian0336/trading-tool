@@ -169,6 +169,38 @@ def place_stop_algo_order(
     return result
 
 
+def close_position_market(
+    client: httpx.Client,
+    secret: str,
+    pos: dict,
+    hedge: bool,
+) -> dict:
+    """Place a MARKET order that fully closes *pos*."""
+    symbol = pos["symbol"]
+    amt    = float(pos["positionAmt"])
+    side   = "SELL" if amt > 0 else "BUY"
+    qty    = abs(amt)
+
+    order: dict = {
+        "symbol":   symbol,
+        "side":     side,
+        "type":     "MARKET",
+        "quantity": qty,
+    }
+    if hedge:
+        order["positionSide"] = pos.get("positionSide", "BOTH")
+    else:
+        order["reduceOnly"] = "true"
+
+    result = signed_post(client, secret, BASE_URL, "/fapi/v1/order", order)
+    assert isinstance(result, dict)
+    log.info(
+        "Market close sent  orderId=%s  status=%s",
+        result.get("orderId"), result.get("status"),
+    )
+    return result
+
+
 # ── Bar-index helpers ──────────────────────────────────────────────────────────
 
 def current_bar_open_ms(interval: str) -> int:
@@ -337,6 +369,11 @@ def _refresh_mark_price(
     return None
 
 
+def _is_breached(is_long: bool, mark_px: float, line_px: float) -> bool:
+    """Return True when mark has already crossed the stop line."""
+    return (is_long and mark_px <= line_px) or (not is_long and mark_px >= line_px)
+
+
 def _refresh_algo_stop(
     client: httpx.Client,
     secret: str,
@@ -347,28 +384,51 @@ def _refresh_algo_stop(
     p1: float,
     t2_ms: int,
     p2: float,
+    mark_px: float,
     current_algo_id: int | None,
-) -> int | None:
+) -> tuple[int | None, bool]:
     """
-    Cancel any existing STOP_MARKET algo orders for the symbol (including ones
-    placed by order_tool.py), then place a fresh order at the current trendline
-    price.  Returns the new algoId, or None if placement fails.
+    Decide what to do at refresh time:
+
+    1. If mark has already crossed the trendline → cancel any open stop algo
+       and fire a MARKET close immediately.  Returns (None, True).
+    2. Otherwise → cancel any existing stop algo and place a fresh
+       STOP_MARKET at the current trendline price.  Returns (algoId, False).
+       On placement failure returns (None, False).
+
+    The boolean return value signals whether a market-close was fired.
     """
     symbol  = pos["symbol"]
+    amt     = float(pos["positionAmt"])
+    is_long = amt > 0
     now_ms  = int(time.time() * 1000)
     line_px = line_price_at(t1_ms, p1, t2_ms, p2, now_ms)
 
+    # Cancel every open stop-algo for this symbol regardless of what we do next
     existing = fetch_open_algo_stop_orders(client, secret, symbol)
     for o in existing:
         cancel_algo_order(client, secret, int(o["algoId"]))
 
+    if _is_breached(is_long, mark_px, line_px):
+        log.warning(
+            "Trendline breached at refresh!  mark=%.4f  line=%.4f  "
+            "Firing market close …",
+            mark_px, line_px,
+        )
+        try:
+            close_position_market(client, secret, pos, hedge)
+        except httpx.HTTPStatusError as exc:
+            log.error("Market close failed: %s", exc)
+        return None, True
+
+    # Mark is still on the safe side — place a fresh STOP_MARKET algo
     try:
         result = place_stop_algo_order(client, secret, pos, hedge,
                                        line_px, tick_size)
-        return int(result["algoId"])
+        return int(result["algoId"]), False
     except httpx.HTTPStatusError as exc:
         log.error("Failed to place algo stop order: %s", exc)
-        return None
+        return None, False
 
 
 def run_monitor(
@@ -388,13 +448,12 @@ def run_monitor(
 
     Strategy
     --------
-    1. On entry (and every *update_interval_s* seconds), cancel any open
-       STOP_MARKET algo orders for the symbol and place a new one at the
-       current trendline price.  This keeps the exchange-side stop in sync
-       with the moving trendline.
-    2. Poll every *poll_interval_s* seconds to check whether the position
-       still exists.  When it disappears (closed by the algo stop or
-       manually), the loop exits and any remaining algo order is cleaned up.
+    Every *poll_interval_s* seconds:
+      1. Compute current trendline price.
+      2. If mark has already crossed the line → fire MARKET close and exit.
+      3. Otherwise, on the first iteration and every *update_interval_s*
+         seconds: cancel any existing STOP_MARKET algo and place a fresh one
+         at the current trendline price.
     """
     symbol   = pos["symbol"]
     amt      = float(pos["positionAmt"])
@@ -418,23 +477,7 @@ def run_monitor(
 
     try:
         while True:
-            now = time.monotonic()
-
-            # ── Refresh algo stop every update_interval_s ───────────────────
-            if now - last_update_t >= update_interval_s:
-                now_ms  = int(time.time() * 1000)
-                line_px = line_price_at(t1_ms, p1, t2_ms, p2, now_ms)
-                log.info(
-                    "Refreshing STOP_MARKET algo  trendline=%.4f  (every %dm)",
-                    line_px, update_interval_s // 60,
-                )
-                current_algo_id = _refresh_algo_stop(
-                    client, secret, pos, hedge, tick_size,
-                    t1_ms, p1, t2_ms, p2, current_algo_id,
-                )
-                last_update_t = now
-
-            # ── Check whether position is still open ────────────────────────
+            # ── Fetch current mark price / confirm position still open ───────
             mark_px = _refresh_mark_price(client, secret, symbol, pos_side, hedge)
             if mark_px is None:
                 log.info("Position %s no longer open — stop fired or closed manually.", symbol)
@@ -443,7 +486,42 @@ def run_monitor(
 
             now_ms  = int(time.time() * 1000)
             line_px = line_price_at(t1_ms, p1, t2_ms, p2, now_ms)
-            next_refresh_s = max(0, update_interval_s - (time.monotonic() - last_update_t))
+
+            # ── Poll: check breach on every iteration ────────────────────────
+            if _is_breached(is_long, mark_px, line_px):
+                log.warning(
+                    "Trendline breached on poll!  mark=%.4f  line=%.4f  "
+                    "Cancelling stop algo and firing market close …",
+                    mark_px, line_px,
+                )
+                if current_algo_id is not None:
+                    cancel_algo_order(client, secret, current_algo_id)
+                try:
+                    close_position_market(client, secret, pos, hedge)
+                except httpx.HTTPStatusError as exc:
+                    log.error("Market close failed: %s", exc)
+                print("\nPosition closed. Exiting.")
+                break
+
+            # ── Refresh algo stop every update_interval_s ───────────────────
+            now = time.monotonic()
+            next_refresh_s = max(0, update_interval_s - (now - last_update_t))
+
+            if now - last_update_t >= update_interval_s:
+                log.info(
+                    "Refreshing STOP_MARKET algo  mark=%.4f  line=%.4f  (every %dm)",
+                    mark_px, line_px, update_interval_s // 60,
+                )
+                current_algo_id, market_fired = _refresh_algo_stop(
+                    client, secret, pos, hedge, tick_size,
+                    t1_ms, p1, t2_ms, p2, mark_px, current_algo_id,
+                )
+                last_update_t = now
+                next_refresh_s = update_interval_s
+                if market_fired:
+                    print("\nPosition closed via market order. Exiting.")
+                    break
+
             log.info(
                 "%s  mark=%.4f  line=%.4f  algoId=%s  next_refresh_in=%ds",
                 symbol, mark_px, line_px,
