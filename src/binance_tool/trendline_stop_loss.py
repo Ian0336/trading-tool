@@ -571,6 +571,27 @@ def main() -> None:
         interval = prompt_interval()
         (t1_ms, p1), (t2_ms, p2) = prompt_trendline_points(interval)
 
+        # Preview trendline at current time so user can sanity-check their input
+        now_ms   = int(time.time() * 1000)
+        line_now = line_price_at(t1_ms, p1, t2_ms, p2, now_ms)
+        mark_now = float(selected["markPrice"])
+        is_long  = float(selected["positionAmt"]) > 0
+        breached = _is_breached(is_long, mark_now, line_now)
+
+        print(f"\n{'─' * 50}")
+        print(f"  Trendline preview  ({ms_to_display(now_ms)} UTC+8)")
+        print(f"    Line value now : {line_now:.4f}")
+        print(f"    Mark price     : {mark_now:.4f}")
+        print(f"    Position side  : {'LONG' if is_long else 'SHORT'}")
+        if breached:
+            print(f"  *** WARNING: mark has already crossed the trendline! ***")
+            print(f"  *** A market-close will fire immediately on start.    ***")
+        else:
+            gap = abs(mark_now - line_now)
+            pct = gap / mark_now * 100
+            print(f"    Distance to stop: {gap:.4f}  ({pct:.2f}%)")
+        print(f"{'─' * 50}")
+
         input("\nPress Enter to start monitoring (Ctrl-C to abort) … ")
 
         run_monitor(
